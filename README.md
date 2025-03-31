@@ -1,19 +1,20 @@
+以下は、文構成や表現をわかりやすく整理したリファクタリング例です。内容やディレクトリ構成、コードはそのままに、説明の流れを自然にしつつ表記ゆれを整えています。必要に応じて調整してご利用ください。
+
+---
+
 # terraform-iam-oidc-ssm
 
-## ✅ なぜEKSは手動、IAM/OIDC/SSMはTerraformで管理するのか？
+## ✅ なぜ EKS は手動、IAM/OIDC/SSM は Terraform で管理するのか？
 
-EKSはクラスタ構築に時間がかかり、壊して再作成することも多いため、
-初期フェーズでは `eksctl` によるCLI構築で高速化する。
+EKS はクラスタ構築に時間がかかるうえ、初期フェーズでは壊して再作成することが多いため、CLI ベースの `eksctl` で高速に構築する方が便利です。
 
-一方、IAM / OIDC / SSM は **クラスタ再作成後も再利用したい構成**かつ、
-**セキュリティポリシーや権限管理のレビュー対象**になるため、
-Terraformでコード化しておくことで、
-- 再現性
-- レビュー性
-- 監査性
-を確保できる。
+一方、IAM / OIDC / SSM は **クラスタ再作成後も再利用したい構成** かつ、**セキュリティポリシーや権限管理のレビュー対象** となるため、Terraform でコード化しておくと以下のメリットが得られます。
 
-そのため、以下の構成では "EKSはeksctl"、"Identity周りはTerraform" を原則とする。
+- **再現性**  
+- **レビュー性**  
+- **監査性**
+
+したがって、本リポジトリでは「EKS クラスタは `eksctl`」「IAM / OIDC / SSM は Terraform」という方針を採用しています。
 
 ---
 
@@ -43,14 +44,15 @@ terraform-iam-oidc-ssm/
 ## ✨ 内容概要
 
 ### iam/irsa_role_argocd.tf
+
 ```hcl
 resource "aws_iam_role" "argocd_irsa" {
-  name = "argocd-irsa-role"
+  name               = "argocd-irsa-role"
   assume_role_policy = data.aws_iam_policy_document.oidc_assume_role.json
 }
 
 resource "aws_iam_policy" "argocd_policy" {
-  name = "argocd-policy"
+  name   = "argocd-policy"
   policy = file("${path.module}/policies/argocd_policy.json")
 }
 
@@ -61,6 +63,7 @@ resource "aws_iam_role_policy_attachment" "argocd_attach" {
 ```
 
 ### iam/policies/argocd_policy.json
+
 ```json
 {
   "Version": "2012-10-17",
@@ -116,6 +119,7 @@ resource "aws_iam_role_policy_attachment" "argocd_attach" {
 ```
 
 ### oidc/oidc_provider.tf
+
 ```hcl
 data "aws_eks_cluster" "this" {
   name = var.cluster_name
@@ -133,6 +137,7 @@ resource "aws_iam_openid_connect_provider" "eks" {
 ```
 
 ### ssm/argocd_admin_password.tf
+
 ```hcl
 resource "aws_ssm_parameter" "argocd_admin_password" {
   name  = "/argocd/admin/password"
@@ -144,6 +149,7 @@ resource "aws_ssm_parameter" "argocd_admin_password" {
 ---
 
 ## 🔧 eksctl.yaml（クラスタ定義）
+
 ```yaml
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
@@ -169,6 +175,7 @@ iam:
 ---
 
 ## 🛠️ Makefile（簡易オペレーション）
+
 ```makefile
 CLUSTER_NAME=kuro-cluster
 
@@ -201,47 +208,48 @@ kubectl apply -f serviceaccount-argocd.yaml
 
 ## ✅ 最終成果
 
-- EKSクラスタは `eksctl` で素早く立ち上がる
-- IAM, OIDC, SSM などの永続セキュリティ設定は Terraform でコード化
-- ArgoCD や Operator が使う IRSA Role を明示的に管理
-- GitHub Actions や Secrets管理にも SSM パラメータを活用
-- ECR / S3 / SecretsManager など、**現場で必要な実用権限も網羅**
+- EKS クラスタは `eksctl` で素早く立ち上がる  
+- IAM / OIDC / SSM などの永続的なセキュリティ構成は Terraform でコード化  
+- ArgoCD や各種 Operator が使う IRSA Role を明示的に管理  
+- GitHub Actions や Secrets 管理にも SSM パラメータを活用  
+- ECR / S3 / Secrets Manager など、**現場で必要な実用的権限を網羅**
+
+これにより、EKS + GitOps インフラが設計面でも強固なものになります。💪
 
 ---
 
-これで黒澤さんのEKS + GitOpsインフラは "設計としても" 強靭になります💪
+## ✅ `eksctl.yaml` の `~/.ssh/id_rsa.pub` について
 
+> **Q.** `~/.ssh/id_rsa.pub` とは何ですか？  
 
-
-いい質問です！  
-`~/.ssh/id_rsa.pub` は、**EC2ノードにSSHでアクセスするための公開鍵**です。  
-EKSクラスタのノード（EC2）に SSH ログインできるようにするには、事前にローカルに **公開鍵 / 秘密鍵ペア** を生成しておく必要があります。
+**A.** EKS のノード（EC2）に SSH 接続するための **公開鍵** です。  
+クラスタで稼働する EC2 にログインできるようにするには、**公開鍵 / 秘密鍵ペア** を事前に生成しておき、`eksctl.yaml` 側で公開鍵を指定します。
 
 ---
 
-## ✅ 生成方法（Mac / Linux / WSL 共通）
+## ✅ SSH 鍵の生成方法（Mac / Linux / WSL 共通）
 
 ```bash
 ssh-keygen -t rsa -b 4096 -C "kuro@example.com"
 ```
 
-### ↳ 実行結果で聞かれる内容
+実行すると以下のように尋ねられます。
 
 ```
 Enter file in which to save the key (/home/yourname/.ssh/id_rsa): [Enter]
 Enter passphrase (empty for no passphrase): [Enter]
 ```
 
-これで以下が生成されます：
+これで下記のファイルが生成されます。
 
-| ファイル | 役割 |
-|---------|------|
-| `~/.ssh/id_rsa` | 秘密鍵（絶対に公開しない） |
-| `~/.ssh/id_rsa.pub` | 公開鍵（EKSノードに配布する） |
+| ファイル              | 役割                                   |
+|-----------------------|----------------------------------------|
+| `~/.ssh/id_rsa`       | 秘密鍵（絶対に公開しない）             |
+| `~/.ssh/id_rsa.pub`   | 公開鍵（EKSノードなどに配布する）      |
 
 ---
 
-## ✅ `eksctl.yaml` ではこう使われる
+## ✅ `eksctl.yaml` での指定例
 
 ```yaml
 ssh:
@@ -249,13 +257,13 @@ ssh:
   publicKeyPath: ~/.ssh/id_rsa.pub
 ```
 
-この設定により、**EKSのノード（EC2）にSSHアクセスが許可される**ようになります。
+この設定により、EKS ノード（EC2）に SSH アクセスが許可されるようになります。
 
 ---
 
 ## ✅ ログイン例（クラスタ作成後）
 
-EKSのNodeにログインしたい場合：
+EKS の Node にログインしたい場合は、まず以下のコマンドでパブリック IP を確認します。
 
 ```bash
 aws ec2 describe-instances \
@@ -264,7 +272,7 @@ aws ec2 describe-instances \
   --output text
 ```
 
-取得したIPを使って：
+取得した IP アドレスに対して SSH でログインします。
 
 ```bash
 ssh ec2-user@<IPアドレス> -i ~/.ssh/id_rsa
@@ -274,10 +282,12 @@ ssh ec2-user@<IPアドレス> -i ~/.ssh/id_rsa
 
 ## ✅ 注意点
 
-- `id_rsa.pub` が存在しないと `eksctl create cluster` で失敗します
-- GitHubなどに **絶対に `id_rsa` をpushしないこと**
-- パーミッションに注意：`chmod 600 ~/.ssh/id_rsa`
+- `id_rsa.pub`（公開鍵）が存在しないと `eksctl create cluster` は失敗します
+- 秘密鍵（`id_rsa`）は **絶対に公開しない**（GitHub などにプッシュしない）
+- パーミッションは `chmod 600 ~/.ssh/id_rsa` などで適切に保護してください
 
 ---
 
-Canvasにこの手順、`README.md` の「補足：SSH鍵の生成方法」に追記しておきましょうか？
+### README.md への反映について
+
+今回の SSH 鍵生成手順などは、README.md の「補足：SSH キーの生成方法」などのセクションにまとめておくと、利用者にとっても分かりやすいです。必要に応じてコピペしてお使いください。
