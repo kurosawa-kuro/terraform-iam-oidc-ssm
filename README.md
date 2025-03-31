@@ -1,124 +1,129 @@
-以下は、文構成や表現をわかりやすく整理したリファクタリング例です。内容やディレクトリ構成、コードはそのままに、説明の流れを自然にしつつ表記ゆれを整えています。必要に応じて調整してご利用ください。
+以下では、**将来の削除やリソース管理を容易にするために**、一貫した**接頭辞（prefix）**を使ってリソース名とタグを付与する方法をご紹介します。ポイントは下記の 2 点です。
+
+1. **「プロジェクト・環境・用途」などを含む統一的な接頭辞**を定義して、AWS リソース名・タグに反映する。  
+2. Terraform と eksctl 双方の設定で同じ接頭辞を使い、AWS コンソールや CLI、課金明細上で見分けやすくする。
 
 ---
 
-# terraform-iam-oidc-ssm
+# 1. Terraform 側での例
 
-## ✅ なぜ EKS は手動、IAM/OIDC/SSM は Terraform で管理するのか？
-
-EKS はクラスタ構築に時間がかかるうえ、初期フェーズでは壊して再作成することが多いため、CLI ベースの `eksctl` で高速に構築する方が便利です。
-
-一方、IAM / OIDC / SSM は **クラスタ再作成後も再利用したい構成** かつ、**セキュリティポリシーや権限管理のレビュー対象** となるため、Terraform でコード化しておくと以下のメリットが得られます。
-
-- **再現性**  
-- **レビュー性**  
-- **監査性**
-
-したがって、本リポジトリでは「EKS クラスタは `eksctl`」「IAM / OIDC / SSM は Terraform」という方針を採用しています。
-
----
-
-## 📁 ディレクトリ構成
-
-```bash
-terraform-iam-oidc-ssm/
-├── main.tf
-├── variables.tf
-├── outputs.tf
-├── iam/
-│   ├── irsa_role_argocd.tf
-│   └── policies/
-│       └── argocd_policy.json
-├── oidc/
-│   └── oidc_provider.tf
-├── ssm/
-│   └── argocd_admin_password.tf
-├── eksctl/
-│   ├── eksctl.yaml
-│   └── Makefile
-└── README.md
-```
-
----
-
-## ✨ 内容概要
-
-### iam/irsa_role_argocd.tf
+## variables.tf
 
 ```hcl
+variable "cluster_name" {
+  type        = string
+  description = "EKS cluster name"
+  default     = "kuro-dev-cluster"
+}
+
+variable "environment" {
+  type        = string
+  description = "Environment (e.g. dev, stg, prod)"
+  default     = "dev"
+}
+
+# 接頭辞（prefix）を定義し、全リソースに流用
+variable "resource_prefix" {
+  type        = string
+  description = "Prefix for resource naming"
+  default     = "kuro-dev"
+}
+
+# リソース全体で使う共通タグ
+variable "common_tags" {
+  type        = map(string)
+  description = "Common tags to apply to all resources"
+  default = {
+    Project     = "kuro-argocd"
+    Environment = "dev"
+    ManagedBy   = "Terraform"
+  }
+}
+```
+
+上記では `resource_prefix` を `kuro-dev` としています（本番なら `kuro-prod` など）。  
+**環境名やプロジェクト名**を混ぜることで、どの環境のリソースなのか一目でわかるようになります。
+
+---
+
+## main.tf 例（抜粋）
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  required_version = ">= 1.3.0"
+}
+
+provider "aws" {
+  region = "ap-northeast-1"
+}
+```
+
+Backend や他の設定は環境に合わせて追加してください。
+
+---
+
+## iam/irsa_role_argocd.tf
+
+```hcl
+data "aws_iam_policy_document" "oidc_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "${aws_iam_openid_connect_provider.eks.url}:sub"
+      values   = ["system:serviceaccount:argocd:argocd-service-account"]
+    }
+  }
+}
+
 resource "aws_iam_role" "argocd_irsa" {
-  name               = "argocd-irsa-role"
+  # 接頭辞を使って IAM Role 名を統一的に命名
+  name               = "${var.resource_prefix}-iam-role-argocd-irsa"
   assume_role_policy = data.aws_iam_policy_document.oidc_assume_role.json
+
+  tags = merge(
+    var.common_tags,
+    {
+      Name = "${var.resource_prefix}-iam-role-argocd-irsa"
+    }
+  )
 }
 
 resource "aws_iam_policy" "argocd_policy" {
-  name   = "argocd-policy"
+  name   = "${var.resource_prefix}-iam-policy-argocd"
   policy = file("${path.module}/policies/argocd_policy.json")
+
+  tags = merge(
+    var.common_tags,
+    {
+      Name = "${var.resource_prefix}-iam-policy-argocd"
+    }
+  )
 }
 
 resource "aws_iam_role_policy_attachment" "argocd_attach" {
   role       = aws_iam_role.argocd_irsa.name
   policy_arn = aws_iam_policy.argocd_policy.arn
+  # aws_iam_role_policy_attachment にはタグを直接付けられないため省略
 }
 ```
 
-### iam/policies/argocd_policy.json
+- IAM Role 名は、 `${var.resource_prefix}-iam-role-argocd-irsa` のように **一貫した命名規則** を採用。
+- タグの `Name` に同じ文字列を入れることで、AWS コンソールや Cost Explorer などで絞り込みが容易になります。
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ssm:GetParameter",
-        "ssm:GetParameters",
-        "ssm:GetParametersByPath"
-      ],
-      "Resource": "arn:aws:ssm:*:*:parameter/argocd/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::your-argocd-bucket",
-        "arn:aws:s3:::your-argocd-bucket/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "secretsmanager:GetSecretValue"
-      ],
-      "Resource": "arn:aws:secretsmanager:*:*:secret:argocd/*"
-    }
-  ]
-}
-```
+---
 
-### oidc/oidc_provider.tf
+## oidc/oidc_provider.tf
 
 ```hcl
 data "aws_eks_cluster" "this" {
@@ -133,33 +138,53 @@ resource "aws_iam_openid_connect_provider" "eks" {
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da0afd29c20"]
   url             = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
+
+  tags = merge(
+    var.common_tags,
+    {
+      Name = "${var.resource_prefix}-iam-oidc-provider"
+    }
+  )
 }
 ```
 
-### ssm/argocd_admin_password.tf
+---
+
+## ssm/argocd_admin_password.tf
 
 ```hcl
 resource "aws_ssm_parameter" "argocd_admin_password" {
   name  = "/argocd/admin/password"
   type  = "SecureString"
   value = var.argocd_admin_password
+
+  tags = merge(
+    var.common_tags,
+    {
+      Name = "${var.resource_prefix}-ssm-argocd-admin-password"
+    }
+  )
 }
 ```
 
 ---
 
-## 🔧 eksctl.yaml（クラスタ定義）
+# 2. eksctl 側での例（`eksctl.yaml`）
 
 ```yaml
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 metadata:
-  name: kuro-cluster
+  name: kuro-dev-cluster
   region: ap-northeast-1
   version: "1.29"
+  tags:
+    Project: "kuro-argocd"
+    Environment: "dev"
+    ManagedBy: "eksctl"
 
 managedNodeGroups:
-  - name: ng-kuro
+  - name: kuro-dev-ng
     instanceType: t3.medium
     desiredCapacity: 1
     minSize: 1
@@ -167,17 +192,24 @@ managedNodeGroups:
     ssh:
       allow: true
       publicKeyPath: ~/.ssh/id_rsa.pub
+    tags:
+      Project: "kuro-argocd"
+      Environment: "dev"
+      ManagedBy: "eksctl"
 
 iam:
   withOIDC: true
 ```
 
+- `metadata.name` と `managedNodeGroups[].name` も `kuro-dev` などの接頭辞を付けて命名。  
+- `tags` にも同じキー・値を付与することで、AWS 上で「Project=**kuro-argocd**」や「Environment=**dev**」等でリソースが一括管理できます。
+
 ---
 
-## 🛠️ Makefile（簡易オペレーション）
+# 3. Makefile 例
 
 ```makefile
-CLUSTER_NAME=kuro-cluster
+CLUSTER_NAME=kuro-dev-cluster
 
 create:
 	eksctl create cluster -f eksctl/eksctl.yaml
@@ -189,105 +221,29 @@ kubeconfig:
 	eksctl utils write-kubeconfig --cluster $(CLUSTER_NAME)
 ```
 
----
-
-## 🚀 実行手順
-
-```bash
-# EKSクラスタ作成（初回のみ）
-make create
-
-# TerraformでIAM/OIDC/SSM構成を反映
-cd terraform-iam-oidc-ssm && terraform init && terraform apply
-
-# ArgoCDのServiceAccountにIRSAをアタッチ
-kubectl apply -f serviceaccount-argocd.yaml
-```
+- `CLUSTER_NAME` にも同じ接頭辞の名前を使い、**Terraform 側との整合性**を保つと良いでしょう。
 
 ---
 
-## ✅ 最終成果
+# 4. 運用イメージ
 
-- EKS クラスタは `eksctl` で素早く立ち上がる  
-- IAM / OIDC / SSM などの永続的なセキュリティ構成は Terraform でコード化  
-- ArgoCD や各種 Operator が使う IRSA Role を明示的に管理  
-- GitHub Actions や Secrets 管理にも SSM パラメータを活用  
-- ECR / S3 / Secrets Manager など、**現場で必要な実用的権限を網羅**
+1. **新しい環境を作るとき**  
+   - `resource_prefix` と `environment` を変更 (例: `kuro-stg`, `kuro-prod`)  
+   - `eksctl.yaml` も `metadata.name` や `managedNodeGroups` に「kuro-stg」「kuro-prod」などを設定  
+   - これにより、**環境ごとに明確に分かれたネーミング/タグ** でリソースが作成される。  
 
-これにより、EKS + GitOps インフラが設計面でも強固なものになります。💪
+2. **削除したいとき**  
+   - AWS コンソールや CLI で `Name` や `Project` タグを基準にフィルタして、不要なリソースを一括で確認・削除できる。  
 
----
-
-## ✅ `eksctl.yaml` の `~/.ssh/id_rsa.pub` について
-
-> **Q.** `~/.ssh/id_rsa.pub` とは何ですか？  
-
-**A.** EKS のノード（EC2）に SSH 接続するための **公開鍵** です。  
-クラスタで稼働する EC2 にログインできるようにするには、**公開鍵 / 秘密鍵ペア** を事前に生成しておき、`eksctl.yaml` 側で公開鍵を指定します。
+3. **Cost Explorer や課金レポートで確認する時**  
+   - 「Project=○○」「Environment=△△」というタグをベースにコスト配分ができるため、誰がどの環境を使っているか可視化しやすい。  
 
 ---
 
-## ✅ SSH 鍵の生成方法（Mac / Linux / WSL 共通）
+# 5. まとめ
 
-```bash
-ssh-keygen -t rsa -b 4096 -C "kuro@example.com"
-```
+- **接頭辞（prefix）** を活用し、`kuro-dev` や `kuro-stg` のように環境や用途を明示したリソース名にする。  
+- **共通タグ** も同じ情報を含めることで、AWS 上でのフィルタやコスト管理がスムーズになる。  
+- Terraform と eksctl の両方で同じ接頭辞を使い、命名規則を統一する。  
 
-実行すると以下のように尋ねられます。
-
-```
-Enter file in which to save the key (/home/yourname/.ssh/id_rsa): [Enter]
-Enter passphrase (empty for no passphrase): [Enter]
-```
-
-これで下記のファイルが生成されます。
-
-| ファイル              | 役割                                   |
-|-----------------------|----------------------------------------|
-| `~/.ssh/id_rsa`       | 秘密鍵（絶対に公開しない）             |
-| `~/.ssh/id_rsa.pub`   | 公開鍵（EKSノードなどに配布する）      |
-
----
-
-## ✅ `eksctl.yaml` での指定例
-
-```yaml
-ssh:
-  allow: true
-  publicKeyPath: ~/.ssh/id_rsa.pub
-```
-
-この設定により、EKS ノード（EC2）に SSH アクセスが許可されるようになります。
-
----
-
-## ✅ ログイン例（クラスタ作成後）
-
-EKS の Node にログインしたい場合は、まず以下のコマンドでパブリック IP を確認します。
-
-```bash
-aws ec2 describe-instances \
-  --filters "Name=tag:eks:cluster-name,Values=kuro-cluster" \
-  --query "Reservations[*].Instances[*].PublicIpAddress" \
-  --output text
-```
-
-取得した IP アドレスに対して SSH でログインします。
-
-```bash
-ssh ec2-user@<IPアドレス> -i ~/.ssh/id_rsa
-```
-
----
-
-## ✅ 注意点
-
-- `id_rsa.pub`（公開鍵）が存在しないと `eksctl create cluster` は失敗します
-- 秘密鍵（`id_rsa`）は **絶対に公開しない**（GitHub などにプッシュしない）
-- パーミッションは `chmod 600 ~/.ssh/id_rsa` などで適切に保護してください
-
----
-
-### README.md への反映について
-
-今回の SSH 鍵生成手順などは、README.md の「補足：SSH キーの生成方法」などのセクションにまとめておくと、利用者にとっても分かりやすいです。必要に応じてコピペしてお使いください。
+これにより、**将来の削除やリソース管理が格段に容易** となり、プロジェクト全体の可観測性やコスト管理も改善されます。ぜひご参考にしてみてください。
